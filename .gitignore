@@ -1,0 +1,14 @@
+.tools/
+.codex-logs/
+build/
+.gradle/
+data/
+*.log
+.idea/
+*.iml
+.vscode/
+.classpath
+.project
+.settings/
+out/
+.jqwik-database

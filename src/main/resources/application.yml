@@ -1,0 +1,41 @@
+server:
+  port: 8080
+spring:
+  application:
+    name: matchforge
+  profiles:
+    group:
+      local: memory
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/matchforge}
+    username: ${DB_USERNAME:matchforge}
+    password: ${DB_PASSWORD:matchforge}
+  flyway:
+    enabled: true
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,prometheus
+matchforge:
+  events:
+    publisher: ${EVENTS_PUBLISHER:in-process}
+  journal:
+    type: ${JOURNAL_TYPE:postgres}
+  snapshot:
+    interval: ${SNAPSHOT_INTERVAL:1000}
+  instruments:
+    - symbol: BTC-USD
+      base-asset: BTC
+      quote-asset: USD
+      tick-size: "0.01"
+      lot-size: "0.00000001"
+      price-scale: 2
+      quantity-scale: 8
+    - symbol: ETH-USD
+      base-asset: ETH
+      quote-asset: USD
+      tick-size: "0.01"
+      lot-size: "0.00000001"
+      price-scale: 2
+      quantity-scale: 8

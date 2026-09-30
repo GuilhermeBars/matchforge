@@ -1,0 +1,5 @@
+# The local profile includes memory through spring.profiles.group in application.yml.
+# Run with --spring.profiles.active=local (or memory).
+spring:
+  main:
+    banner-mode: "off"
