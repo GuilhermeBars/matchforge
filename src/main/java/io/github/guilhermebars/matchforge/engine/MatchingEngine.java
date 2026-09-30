@@ -73,6 +73,12 @@ public final class MatchingEngine {
             events.add(new OrderRejected(header, accountOf(command), rejected.reason));
             outcome = new Outcome(Status.REJECTED, null, rejected.reason, 0, List.of());
         }
+        if (outcome.status() == Status.CANCELLED) {
+            var cancellation = events.stream().filter(e -> e instanceof OrderCancelled)
+                    .map(e -> (OrderCancelled) e).reduce((a, b) -> b).orElseThrow();
+            outcome = new Outcome(outcome.status(), outcome.orderId(), outcome.reason(), outcome.remainingQuantity(),
+                    outcome.trades(), cancellation.reason());
+        }
         if (command instanceof PlaceOrder p && p.accountId() != null && p.clientOrderId() != null)
             idempotency.put(new Key(p.accountId(), p.clientOrderId()), new EngineSnapshot.IdempotencyEntry(p, outcome));
         return new CommandResult(outcome, events, false);

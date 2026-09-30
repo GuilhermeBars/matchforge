@@ -18,7 +18,10 @@ management:
   endpoints:
     web:
       exposure:
-        include: health,prometheus
+        include: health,info,prometheus,metrics
+  metrics:
+    tags:
+      application: matchforge
 matchforge:
   engine:
     queue-capacity: ${ENGINE_QUEUE_CAPACITY:1024}
@@ -43,5 +46,6 @@ matchforge:
       lot-size: "0.00000001"
       price-scale: 2
       quantity-scale: 8
+
 
 

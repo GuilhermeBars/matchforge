@@ -1,9 +1,9 @@
-ï»¿# Matchforge architecture
+# Matchforge architecture
 
-Sessions 1â€“3 deliver the framework-free matching/risk/ledger core, command WAL,
+Sessions 1–4 deliver the framework-free matching/risk/ledger core, command WAL,
 Postgres and memory persistence, checksummed snapshots, recovery, a bounded
 single-writer service, immutable read models, event publishers and metrics.
-REST and WebSocket endpoints remain for subsequent sessions.
+Session 4 adds the v1 REST API, OpenAPI, WebSocket market data and transport integration tests.
 
 ```mermaid
 flowchart LR
@@ -38,7 +38,7 @@ own framework wiring. REST DTOs do not enter the engine directly.
 `CompletableFuture<CommandResult>` per submission. `matchforge.engine.queue-capacity`
 (default 1024) bounds pending work, excluding the one running command. A full or
 closed queue fails the future with `UnavailableException`, annotated for HTTP 503;
-the future REST adapter must unwrap asynchronous failures. The writer assigns the
+the REST advice unwraps asynchronous failures into stable RFC 7807 problems. The writer assigns the
 contiguous sequence and UTC timestamp (microsecond precision for PostgreSQL) before
 persistence. Account IDs are caller-supplied; monotonic order/trade counters live in
 engine snapshots. Admission resumes only after synchronous startup recovery.
@@ -176,7 +176,7 @@ and database/network timeouts should be set for the deployment.
 immutable `PlaceOrder` payload and original `CommandResult.Outcome` (including
 original fills). Identical retries return that outcome with `duplicate=true` and
 an empty event batch; different payloads return distinct `CONFLICT` status and
-`DUPLICATE_CLIENT_ORDER_ID` reason for a future HTTP 409 mapping. Every submitted
+`DUPLICATE_CLIENT_ORDER_ID` reason mapped to HTTP 409. Every submitted
 envelope still consumes its contiguous command sequence. Lookup/insertion occur
 on the writer. Replay and snapshots restore outcomes, including rejections;
 transport timeouts must not cause a second order.
@@ -206,7 +206,7 @@ orders, book crossing, order validity, IDs and the aggregate holdings bound.
 Each immutable batch is delivered synchronously in registration order. All listeners
 are attempted even if one fails; failure then fences EngineService. Future WebSocket
 listeners must enqueue onto bounded subscriber queues rather than block the writer.
-No WebSocket endpoint is implemented in this session.
+The WebSocket adapter uses bounded per-client queues and never sends on the writer.
 
 `matchforge.events.publisher=kafka` conditionally creates the producer factory,
 KafkaTemplate and `KafkaEventPublisher`. Kafka autoconfiguration is excluded in
@@ -243,19 +243,77 @@ in `src/jmh/java`; no engine performance results exist yet. Later integration
 tests must use `@Testcontainers(disabledWithoutDocker = true)` locally and run
 with Docker in CI. Engine JUnit tests cover matching, risk, FIFO/replacements,
 atomic FOK/self-trade rejection, settlement, idempotency and JSON snapshots.
-Two jqwik properties each run 60 generated sequences of 30â€“100 actions across two
+Two jqwik properties each run 60 generated sequences of 30–100 actions across two
 symbols and three funded accounts, checking invariants after each command and
 identical replay/snapshot continuation. Session 3 adds pipeline recovery, checksum,
 idempotency, backpressure and failure-path tests. A 50-try jqwik journal property
 compares full replay and snapshot-tail recovery. Postgres 16 Testcontainers tests
 cover append/read, writer fencing, durable recovery and checksum tampering; they
 skip without Docker. Kafka routing/failure tests use a mocked broker client.
-REST and WebSocket integration tests belong to later sessions.
+REST, WebSocket and Postgres REST restart tests are implemented in Session 4.
 
 Authentication is out of scope: requests will carry account IDs, so the planned
 API must not be exposed as a production exchange. The core is implemented;
-the REST API, WebSocket feed and durable external delivery remain for later sessions.
+REST and WebSocket transports are implemented; durable external delivery remains future work.
 Core reads and snapshots must run on the owning writer thread; callers read the
 service's immutable published views.
 
+
+
+
+## REST and market-data transport (Session 4)
+
+All SPEC v1 routes are implemented under `/api/v1`. Account creation accepts an
+optional `{ "id": "alice" }`; omitting it generates a UUID at the HTTP boundary.
+All price, quantity, balance, budget and signed ledger amounts are JSON strings.
+JSON numeric tokens, exponents, precision loss and overflow are rejected. Boundary
+conversion uses each instrument's canonical fixed-point scales. Weighted average
+fill price uses arbitrary-precision accumulation and HALF_UP rounding to price
+scale; it is null before any fill. Order status maps OPEN to NEW or PARTIALLY_FILLED.
+Cancellation reasons are retained in outcomes, idempotency and snapshots. The additive
+persistence field is omitted when null to preserve legacy snapshot checksums.
+Legacy snapshots lack historical cancellation reasons; full journal replay restores them.
+
+POST orders returns 201 initially; a successful retry returns 200 with
+`Idempotent-Replay: true` and the original response body, even after maker fills,
+cancellation or restart. Idempotency compares canonical fixed-point payloads, so
+`100` and `100.00` mean the same price. Rejected retries preserve their original
+error status and also carry the replay header. Business rejection problems include
+an `order` extension with REJECTED status and reason. Problems carry a stable
+`code` and a `urn:matchforge:problem:<code>` type. Unknown entities map to 404,
+conflicts to 409, insufficient funds/self-trade to 422, invalid input to 400 and
+writer overload to 503. There is no authentication or authorization; cancel and
+replace resolve the stored owner. This API must not be exposed as a production
+exchange. Replacement quantity means new remaining quantity; omitted fields retain
+the currently published open-order values. Depth is limited to 1..100 and trade
+history requests to 1..1000 (latest first).
+
+Swagger UI is `/swagger-ui.html`, with the OpenAPI document at `/v3/api-docs`.
+Actuator exposes health, info, prometheus and metrics; all meters carry
+`application=matchforge`.
+
+`/ws/market-data` accepts subscribe/unsubscribe objects containing `op`, `channel`
+(book or trades), and `symbol`. Each new subscription first receives a book
+snapshot. Envelopes contain `channel`, `symbol`, `type`, `sequence`, and `data`.
+The transport sequence is strictly increasing per symbol per connection, shared
+by both channels, and resets on reconnect; it is distinct from the command
+sequence in book data. Reconnect requires a fresh subscription/snapshot. Book
+updates are complete aggregated top-10 snapshots, coalesced every 75ms and sent
+only when levels change. Intermediate book states are intentionally omitted;
+trade prints are FIFO and are never silently dropped for an active subscriber.
+
+Each connection has a 256-message queue, a virtual sender thread and a
+ConcurrentWebSocketSessionDecorator (2-second send / 64-KiB buffer limits).
+An independent watchdog checks blocked sends; queue overflow or a slow send
+closes that connection so clients must resubscribe. Invalid subscriptions close
+with BAD_DATA. Disconnect clears the queue and removes the subscriber; shutdown
+unregisters the publisher listener and stops ticker/senders. In Kafka mode the
+publisher fans out locally as well as to Kafka, preserving WebSocket delivery.
+No replay feed or durable external event-delivery guarantee is provided.
+
+Integration tests use MockMvc and a real random-port StandardWebSocketClient.
+Docker-gated tests cover a full PostgreSQL REST settlement, context shutdown,
+snapshot plus journal-tail recovery, original idempotent responses, and a real
+Kafka event consumer. The local port-8080 smoke transcript is generated under
+`.codex-logs/session4-smoke.txt`; it is not a benchmark.
 

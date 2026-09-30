@@ -2,6 +2,7 @@ package io.github.guilhermebars.matchforge.journal;
 
 import com.fasterxml.jackson.annotation.JsonSubTypes;
 import com.fasterxml.jackson.annotation.JsonTypeInfo;
+import com.fasterxml.jackson.annotation.JsonInclude;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
@@ -22,9 +23,15 @@ public final class PersistenceCodec {
         @JsonSubTypes.Type(value = Command.ReplaceOrder.class, name = "replace-order.v1")
     })
     private interface CommandTypes {}
+    // Keep pre-session-4 snapshot checksums stable when the additive field is absent.
+    private interface OutcomeFields {
+        @JsonInclude(JsonInclude.Include.NON_NULL)
+        io.github.guilhermebars.matchforge.engine.DomainEvent.CancelReason cancelReason();
+    }
     private final ObjectMapper mapper = new ObjectMapper().registerModule(new JavaTimeModule())
             .disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS)
-            .addMixIn(Command.class, CommandTypes.class);
+            .addMixIn(Command.class, CommandTypes.class)
+            .addMixIn(io.github.guilhermebars.matchforge.engine.CommandResult.Outcome.class, OutcomeFields.class);
     public String type(Command command) {
         return switch (command) {
             case Command.CreateAccount c -> "create-account.v1";

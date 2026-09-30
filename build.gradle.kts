@@ -30,6 +30,7 @@ dependencies {
     testImplementation("net.jqwik:jqwik:1.9.3")
     testImplementation("org.testcontainers:junit-jupiter")
     testImplementation("org.testcontainers:postgresql")
+    testImplementation("org.testcontainers:kafka")
     testRuntimeOnly("org.junit.platform:junit-platform-launcher")
 }
 
@@ -46,3 +47,4 @@ tasks.jacocoTestReport {
     reports { xml.required.set(true); html.required.set(true) }
 }
 jmh { threads.set(1); fork.set(1) }
+

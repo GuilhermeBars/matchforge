@@ -15,7 +15,7 @@ import java.util.Map;
 
 @Configuration(proxyBeanMethods = false)
 public class EngineConfiguration {
-    @Bean @ConditionalOnProperty(name = "matchforge.events.publisher", havingValue = "in-process", matchIfMissing = true)
+    @Bean
     InProcessEventPublisher inProcessEventPublisher() { return new InProcessEventPublisher(); }
     @Configuration(proxyBeanMethods = false)
     @ConditionalOnProperty(name = "matchforge.events.publisher", havingValue = "kafka")
@@ -37,6 +37,17 @@ public class EngineConfiguration {
         }
         @Bean KafkaEventPublisher kafkaEventPublisher(KafkaTemplate<String, String> template, PersistenceCodec codec) {
             return new KafkaEventPublisher(template, codec);
+        }
+        @Bean @Primary EventPublisher combinedPublisher(InProcessEventPublisher local, KafkaEventPublisher kafka) {
+            return new EventPublisher() {
+                @Override public void publish(java.util.List<io.github.guilhermebars.matchforge.engine.DomainEvent> events) {
+                    local.publish(events); kafka.publish(events);
+                }
+                @Override public void publish(io.github.guilhermebars.matchforge.engine.CommandEnvelope command,
+                        java.util.List<io.github.guilhermebars.matchforge.engine.DomainEvent> events) {
+                    local.publish(events); kafka.publish(command, events);
+                }
+            };
         }
     }
     @Bean EngineService engineService(MatchforgeProperties properties, Journal journal, SnapshotStore snapshots,

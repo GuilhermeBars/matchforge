@@ -137,7 +137,7 @@ public final class EngineService implements AutoCloseable {
             var old = orders.get(outcome.orderId());
             if (old != null && !old.trades().isEmpty()) {
                 var fills = new ArrayList<>(old.trades()); fills.addAll(outcome.trades());
-                outcome = new CommandResult.Outcome(outcome.status(), outcome.orderId(), outcome.reason(), outcome.remainingQuantity(), fills);
+                outcome = new CommandResult.Outcome(outcome.status(), outcome.orderId(), outcome.reason(), outcome.remainingQuantity(), fills, outcome.cancelReason());
             }
             orders.put(outcome.orderId(), outcome);
         }
