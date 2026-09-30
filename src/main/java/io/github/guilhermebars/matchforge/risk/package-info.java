@@ -1,2 +1,2 @@
-/** Account balances and pre-trade reservations (planned). */
+/** Checked account balances and pre-trade reservation validation. */
 package io.github.guilhermebars.matchforge.risk;

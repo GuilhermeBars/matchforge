@@ -1,20 +1,21 @@
 # Matchforge architecture
 
-Session 1 delivers domain values, validated configuration, the local journal, schema,
-and build/test infrastructure. The engine, HTTP API, durable adapter, publishers,
-and recovery described below are the implementation plan for subsequent sessions.
+Sessions 1–2 deliver domain values, validated configuration, the local journal,
+schema, build/test infrastructure, and the framework-free matching/risk/ledger core.
+The HTTP API, durable adapters, dispatcher, publishers and recovery orchestration
+below remain the implementation plan for subsequent sessions.
 
 ```mermaid
 flowchart LR
     REST[api.OrderController / AccountController] --> D[engine.CommandDispatcher]
     D --> S[engine.CommandSequencer]
-    S --> I[idempotency.IdempotencyStore]
-    I --> WAL[journal.Journal: command WAL]
+    S --> WAL[journal.Journal: command WAL]
     WAL --> E[engine.MatchingEngine: one writer]
-    E --> R[risk.RiskManager / AccountBalances]
+    E --> I[engine-owned idempotency outcomes]
+    E --> R[risk.RiskManager / AccountBook]
     E --> B[engine.OrderBook / PriceLevel]
-    E --> L[ledger.LedgerService]
-    E --> EV[events.DomainEvent batches]
+    E --> L[ledger.Ledger]
+    E --> EV[engine.DomainEvent batches]
     EV --> P[events.EventPublisher]
     P --> WS[ws.MarketDataWebSocketHandler]
     P --> M[events.MetricsEventListener]
@@ -35,21 +36,32 @@ own framework wiring. REST DTOs do not enter the engine directly.
 
 `CommandDispatcher` owns a bounded queue and one executor thread, with one
 `CompletableFuture<CommandResult>` per submitted command. `CommandSequencer`
-assigns sequence, timestamp and deterministic identifiers before persistence.
+assigns sequence and timestamp before persistence. Account IDs are caller-supplied;
+the engine allocates monotonic order/trade IDs, with counters included in snapshots.
 `MatchingEngine.process(CommandEnvelope)` receives sealed command records
 `PlaceOrder`, `CancelOrder`, `ReplaceOrder`, `CreateAccount`, `Deposit`, and
 `Withdraw`. It returns an immutable `CommandResult` and ordered `DomainEvent`
 batch; it never reads a clock, generates random IDs or performs I/O.
 
 `OrderBook` stores bids descending and asks ascending in `TreeMap<Long, PriceLevel>`.
-`PriceLevel` uses intrusive doubly linked `RestingOrder` nodes for FIFO matching;
-an `OrderId` index points directly to nodes for O(1) removal (removing an empty
-price level still costs O(log levels)). `ReplaceOrder` keeps priority for a
+`PriceLevel` uses an insertion-ordered `LinkedHashMap<OrderId, OpenOrder>` as its
+FIFO queue; replacing a value preserves its position. A per-book `OrderId` index
+locates the level for O(1) queue removal (level lookup/removal costs O(log levels)).
+Cancel/replace currently locates the symbol across the configured books; this is
+O(number of symbols), followed by indexed removal. `ReplaceOrder` keeps priority for a
 quantity decrease at the same price; a price change or increase loses priority.
 IOC and market remainders expire. FOK preflights liquidity, risk and self-trade
 constraints before any mutation. Self-trade policy is **reject newest**: preflight
 rejects the entire incoming command if its executable path would hit its own
 resting order, preventing partial side effects before rejection.
+
+Replace quantity means **new remaining quantity**, and the order ID stays stable.
+A requeued replacement emits `OrderCancelled(REPLACED)` and `OrderReplaced`, then
+any trades/resting event. Same-price equal quantity also retains priority. A failed
+replace leaves the original order and reservation intact. FOK kill changes no
+books, balances, ledger or trade IDs; command sequence, an allocated cancelled
+order ID and its idempotency outcome are still recorded. Events carry the caller's
+sequence/timestamp; trades additionally have a globally increasing trade ID.
 
 Reads use atomically published immutable `ExchangeReadModel` views, or queue a
 read on the engine thread. They never traverse mutable books from HTTP threads.
@@ -70,17 +82,23 @@ account, order and client order IDs allow 1..128 ASCII identifier characters.
 
 `Price.multiply(Quantity, resultScale)` uses `Math.multiplyExact` before exact
 rescaling; overflow (even an intermediate product) and fractional output atoms
-are rejected, never silently rounded. The current instruments use price scale 2
-and quantity scale 8. Planned `AssetPrecisionRegistry` uses base scale 8 and USD
-settlement scale 10, so one tick times one lot is representable. A shared asset
-must have one settlement scale across all markets; startup wiring must enforce
-that invariant before adding new markets. Bounds checks precede state mutation.
+are rejected, never silently rounded. Engine command amounts are canonical long
+atoms: base settlement scale equals quantity scale, quote settlement scale equals
+price scale + quantity scale. Thus notional is `Math.multiplyExact(price, qty)`.
+The current instruments use price scale 2, base scale 8 and USD scale 10. The engine
+constructor enforces one consistent scale per shared asset and a maximum scale of
+18; incompatible market configurations fail immediately. Total customer holdings
+per asset are capped at `Long.MAX_VALUE`: deposits preflight this bound, ensuring
+all subsequent transfers and reservation releases can be represented without
+overflow. Bounds checks precede state mutation.
 
-`AccountBalances` owns available/reserved amounts per `(AccountId, Asset)`.
+`AccountBook` owns available/reserved amounts per `(AccountId, Asset)`.
 `RiskManager` checks known instruments, positive tick/lot-compliant sizes and
 sufficient funds. Buy limits reserve limit price times quantity in quote atoms;
 sells reserve base quantity. Market buys require an explicit positive quote
-budget, and stop before exceeding it. On fills, reservations settle to the
+budget (in quote settlement atoms), reserve that entire budget, and stop before
+exceeding it. A budget above available funds is rejected. Affordable quantity is
+rounded down to whole lots; market remainders never rest. On fills, reservations settle to the
 counterparty; buy price improvement is released immediately. Cancel/expiry
 releases the remaining reservation. Replace preflights its complete reservation
 delta before modifying the existing order. Fees default to zero; later fee
@@ -96,7 +114,8 @@ recovery applies commands once, never both commands and their derived events.
 If event entries use journal sequences, their ordering must be deterministic and
 snapshots must always end on a fully completed command/event batch boundary.
 
-The writer checks idempotency, then commits the command WAL, processes the engine,
+The planned writer commits the command WAL, processes the engine (including its
+authoritative idempotency check),
 records its result, updates read models and acknowledges the request. A WAL failure
 has no engine effects. An unexpected failure after commit fences the writer:
 stop admission and recover before continuing. Business rejections are deterministic
@@ -109,6 +128,14 @@ commands and handles the future admin endpoint. `SnapshotStore` will have
 versioned immutable copies captured at an engine command boundary, containing
 books/FIFO order, balances/reservations, IDs, sequence, idempotency results,
 instrument precision/configuration fingerprint and required read-model state.
+The implemented version-1 `EngineSnapshot` includes concrete instrument records,
+account/balance records, open orders in side/price/FIFO order, complete ledger,
+next order/trade IDs, last command sequence and idempotency request/outcome pairs.
+`MatchingEngine.restore(snapshot)` validates version, precision and financial/book
+invariants. Snapshots use deeply immutable lists and concrete record components;
+Jackson plus `JavaTimeModule` round-trips them without core annotations or mixins.
+The complete ledger/idempotency history is retained in memory for now; compaction
+and bounded retention require a later explicit policy.
 Persist only completed snapshots to `snapshot(seq, payload, created_at)`.
 `RecoveryService` loads the latest compatible snapshot, replays later commands
 without external publication, rebuilds projections and then opens admission.
@@ -118,13 +145,16 @@ will enforce this. No journal pruning is planned until recovery is proven.
 
 ## Idempotency, settlement and delivery
 
-`IdempotencyStore` keys placement by `(AccountId, ClientOrderId)`, stores a canonical
-command fingerprint and the original `CommandResult`. Identical retries return
-that result; a different payload yields HTTP 409. Lookup and insertion occur on
-the writer. Journal replay and snapshots restore results, including rejections;
+`MatchingEngine` keys placement by `(AccountId, ClientOrderId)`, stores the complete
+immutable `PlaceOrder` payload and original `CommandResult.Outcome` (including
+original fills). Identical retries return that outcome with `duplicate=true` and
+an empty event batch; different payloads return distinct `CONFLICT` status and
+`DUPLICATE_CLIENT_ORDER_ID` reason for a future HTTP 409 mapping. Every submitted
+envelope still consumes its contiguous command sequence. Lookup/insertion occur
+on the writer. Replay and snapshots restore outcomes, including rejections;
 transport timeouts must not cause a second order.
 
-`LedgerService` creates immutable signed `LedgerPosting` records: debit buyer
+`Ledger` creates immutable signed `Posting` records in balanced `Transaction`s: debit buyer
 quote / credit seller quote, debit seller base / credit buyer base. Each trade's
 postings sum to zero per asset. Deposits and withdrawals use an external clearing
 account so all ledger transactions balance; customer plus house balances equal
@@ -132,6 +162,15 @@ net external funding. `LedgerReadModel` persists postings transactionally with
 unique `(journal_seq, posting_index)` keys for replay-safe updates. The V1 table
 is a rebuildable projection; cross-row balancing is enforced by the service,
 not falsely claimed as a row-level SQL constraint.
+
+`EXTERNAL` is reserved and cannot be created as a customer. Reserve/release only
+moves holdings between available and reserved; it creates no settlement posting.
+Deposits, withdrawals and every individual fill emit `LedgerPosted` with balanced
+postings. Fees are fixed at zero in this session. `Ledger.trialBalance` uses
+`BigInteger` for safe accumulation across arbitrarily long histories;
+`assertConservation` reconciles ledger holdings with every account/asset.
+`MatchingEngine.assertInvariants` additionally checks reservations against open
+orders, book crossing, order validity, IDs and the aggregate holdings bound.
 
 `InProcessEventPublisher` fans out immutable sequenced batches to WebSocket and
 metrics listeners. `/ws/market-data` accepts book/trade subscriptions and publishes
@@ -159,9 +198,14 @@ Java 21 must already exist; toolchain auto-download is disabled. JUnit Jupiter a
 jqwik both run, and test finalizes XML/HTML JaCoCo reporting. JMH sources belong
 in `src/jmh/java`; no engine performance results exist yet. Later integration
 tests must use `@Testcontainers(disabledWithoutDocker = true)` locally and run
-with Docker in CI. Later sessions will prove price-time priority, risk/ledger
-invariants, FOK atomicity, idempotency, restart replay, REST and WebSocket flows.
+with Docker in CI. Engine JUnit tests cover matching, risk, FIFO/replacements,
+atomic FOK/self-trade rejection, settlement, idempotency and JSON snapshots.
+Two jqwik properties each run 60 generated sequences of 30–100 actions across two
+symbols and three funded accounts, checking invariants after each command and
+identical replay/snapshot continuation. REST, durable restart and WebSocket
+integration tests belong to later sessions.
 
 Authentication is out of scope: requests will carry account IDs, so the planned
-API must not be exposed as a production exchange. This scaffold does not yet
-implement matching, the API, Postgres journal/recovery, snapshots or publication.
+API must not be exposed as a production exchange. The core is implemented;
+the API, Postgres journal/recovery, snapshot persistence and publication remain
+for later sessions. Core reads and snapshots must run on the owning writer thread.
