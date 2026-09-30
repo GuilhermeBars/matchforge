@@ -1,0 +1,50 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: matchforge
+      POSTGRES_USER: matchforge
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-matchforge}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U matchforge -d matchforge"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+  app:
+    image: matchforge:local
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DB_URL: jdbc:postgresql://postgres:5432/matchforge
+      DB_USERNAME: matchforge
+      DB_PASSWORD: ${DB_PASSWORD:-matchforge}
+      EVENTS_PUBLISHER: ${EVENTS_PUBLISHER:-in-process}
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
+    ports:
+      - "8080:8080"
+  redpanda:
+    image: redpandadata/redpanda:v24.3.6
+    profiles: [kafka]
+    command:
+      - redpanda
+      - start
+      - --mode=dev-container
+      - --smp=1
+      - --memory=512M
+      - --reserve-memory=0M
+      - --kafka-addr=0.0.0.0:9092
+      - --advertise-kafka-addr=redpanda:9092
+    healthcheck:
+      test: ["CMD", "rpk", "cluster", "health", "--exit-when-healthy"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    volumes:
+      - redpanda-data:/var/lib/redpanda/data
+volumes:
+  postgres-data:
+  redpanda-data:

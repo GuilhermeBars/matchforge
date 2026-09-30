@@ -1,0 +1,13 @@
+.git
+.github
+.gradle
+.tools
+.codex
+.agents
+.codex-logs
+build
+data
+docs
+*.log
+.idea
+.vscode
