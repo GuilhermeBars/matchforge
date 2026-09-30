@@ -1,326 +1,319 @@
 # Matchforge architecture
 
-Sessions 1–4 deliver the framework-free matching/risk/ledger core, command WAL,
-Postgres and memory persistence, checksummed snapshots, recovery, a bounded
-single-writer service, immutable read models, event publishers and metrics.
-Session 4 adds the v1 REST API, OpenAPI, WebSocket market data and transport integration tests.
+Matchforge is a single-instance exchange core with command sourcing, an
+in-memory matching engine and PostgreSQL recovery. This document describes the
+implemented boundaries and failure semantics. The [README](../README.md) covers
+startup, matching rules and captured API examples.
+
+## Components
 
 ```mermaid
 flowchart LR
-    REST[api.OrderController / AccountController] --> D[service.EngineService]
-    D --> S[writer sequence + clock]
-    S --> WAL[journal.Journal: command WAL]
-    WAL --> E[engine.MatchingEngine: one writer]
-    E --> I[engine-owned idempotency outcomes]
-    E --> R[risk.RiskManager / AccountBook]
-    E --> B[engine.OrderBook / PriceLevel]
+    REST[REST clients] --> C[api.ExchangeController]
+    WS[WebSocket clients] <--> H[ws.MarketDataWebSocketHandler]
+    C --> S[service.EngineService: bounded single writer]
+    S --> J[journal.Journal: command WAL]
+    J -->|append before apply| E[engine.MatchingEngine]
+    E --> B[engine.OrderBook]
+    E --> R[risk.RiskManager and AccountBook]
     E --> L[ledger.Ledger]
-    E --> EV[engine.DomainEvent batches]
-    EV --> P[events.EventPublisher]
-    P --> WS[ws.MarketDataWebSocketHandler]
-    P --> M[events.MetricsEventListener]
-    P --> K[events.KafkaEventPublisher: optional]
-    EV --> V[service.ExchangeReadModel]
-    E --> SS[journal.SnapshotStore]
-    SS --> REC[EngineService startup recovery]
-    WAL --> REC
+    E --> I[Engine-owned idempotency outcomes]
+    E --> EV[DomainEvent batch]
+    EV --> S
+    S --> V[Immutable ExchangeReadModel]
+    V --> C
+    V --> H
+    S --> M[Micrometer metrics]
+    S --> P[InProcessEventPublisher]
+    P --> H
+    S --> K[Optional KafkaEventPublisher]
+    K --> T[matchforge.events]
+    S --> SS[SnapshotStore]
+    SS --> REC[Startup restore and journal-tail replay]
+    J --> REC
     REC --> E
 ```
 
-## Boundaries and concurrency
+All packages are under `io.github.guilhermebars.matchforge`. Domain, engine,
+risk and ledger code has no Spring dependency. The `idempotency` package
+documents a concern implemented within `MatchingEngine`, not a separate
+service. Spring configuration owns adapters. REST DTOs are validated and
+converted into domain commands at the HTTP boundary.
 
-All packages live under `io.github.guilhermebars.matchforge`. `domain`, `engine`,
-`risk`, `ledger` core and `idempotency` core have no Spring dependency.
-`MatchforgeApplication`, `config.MatchforgeProperties` and adapter configurations
-own framework wiring. REST DTOs do not enter the engine directly.
+## Command pipeline and concurrency
 
-`EngineService` owns a bounded single-thread executor and returns one
-`CompletableFuture<CommandResult>` per submission. `matchforge.engine.queue-capacity`
-(default 1024) bounds pending work, excluding the one running command. A full or
-closed queue fails the future with `UnavailableException`, annotated for HTTP 503;
-the REST advice unwraps asynchronous failures into stable RFC 7807 problems. The writer assigns the
-contiguous sequence and UTC timestamp (microsecond precision for PostgreSQL) before
-persistence. Account IDs are caller-supplied; monotonic order/trade counters live in
-engine snapshots. Admission resumes only after synchronous startup recovery.
+`EngineService` owns a one-thread `ThreadPoolExecutor` with an
+`ArrayBlockingQueue`. Capacity defaults to 1,024 pending tasks, excluding the
+running task. Full/closed admission produces `UnavailableException`, mapped to
+HTTP 503. Each submission returns a `CompletableFuture`, which the controller
+joins. Snapshots share the writer.
 
-`MatchingEngine.process(CommandEnvelope)` receives sealed command records
-`PlaceOrder`, `CancelOrder`, `ReplaceOrder`, `CreateAccount`, `Deposit`, and
-`Withdraw`. It returns an immutable `CommandResult` and ordered `DomainEvent`
-batch; it never reads a clock, generates random IDs or performs I/O.
+The live pipeline is:
 
-`OrderBook` stores bids descending and asks ascending in `TreeMap<Long, PriceLevel>`.
-`PriceLevel` uses an insertion-ordered `LinkedHashMap<OrderId, OpenOrder>` as its
-FIFO queue; replacing a value preserves its position. A per-book `OrderId` index
-locates the level for O(1) queue removal (level lookup/removal costs O(log levels)).
-Cancel/replace currently locates the symbol across the configured books; this is
-O(number of symbols), followed by indexed removal. `ReplaceOrder` keeps priority for a
-quantity decrease at the same price; a price change or increase loses priority.
-IOC and market remainders expire. FOK preflights liquidity, risk and self-trade
-constraints before any mutation. Self-trade policy is **reject newest**: preflight
-rejects the entire incoming command if its executable path would hit its own
-resting order, preventing partial side effects before rejection.
+1. Assign the next contiguous sequence and UTC timestamp, truncated to
+   microseconds for PostgreSQL.
+2. Encode and append the command to the journal.
+3. Apply it through `MatchingEngine.process`, including the idempotency check.
+4. Project current orders/recent trades and publish an immutable view.
+5. Record business metrics and publish the event batch.
+6. Save a snapshot if the sequence reaches the configured interval.
+7. Complete the future and construct the HTTP response.
 
-Replace quantity means **new remaining quantity**, and the order ID stays stable.
-A requeued replacement emits `OrderCancelled(REPLACED)` and `OrderReplaced`, then
-any trades/resting event. Same-price equal quantity also retains priority. A failed
-replace leaves the original order and reservation intact. FOK kill changes no
-books, balances, ledger or trade IDs; command sequence, an allocated cancelled
-order ID and its idempotency outcome are still recorded. Events carry the caller's
-sequence/timestamp; trades additionally have a globally increasing trade ID.
+Idempotency is checked **after append**, on the writer. Identical retries and
+conflicts still consume sequences. HTTP validation failures before submission
+do not enter the journal.
 
-Reads use atomically published immutable `ExchangeReadModel` views, or queue a
-read on the engine thread. They never traverse mutable books from HTTP threads.
-The single writer simplifies deterministic replay and cross-asset settlement but
-limits throughput to one core. Symbol sharding is a roadmap item requiring a
-coordinated account reservation design. Shutdown stops admission, drains accepted
-commands, then closes publishers, the executor and database resources.
+The engine receives `CommandEnvelope(sequence, timestamp, command)` and returns
+immutable outcomes/events. It reads no clock, performs no I/O and generates no
+random IDs. Order/trade counters belong to engine state. Account IDs are supplied
+in commands; the HTTP boundary generates a UUID when creation omits an ID.
+Determinism assumes the same envelopes, configuration and matching implementation,
+not concurrent HTTP arrival timing.
 
-## Fixed point and risk
+One writer avoids interleaved book/risk/settlement mutations. The idea is in the
+spirit of LMAX, but implemented with a JDK executor, not Disruptor. It limits
+parallelism and includes journal, publisher and snapshot work in command latency.
+Sharding would also require coordinated account reservations across markets.
 
-`Price(long units, int scale)` and `Quantity(long units, int scale)` accept scales
-0..18, parse unsigned plain decimal strings exactly, and format without exponents.
-Scale is part of identity; arithmetic/comparison requires canonical scales.
-Zero represents empty balances/remainders; `InstrumentConfig` rejects zero order
-price/quantity and enforces exact tick/lot multiples and configured scales.
-Identifiers preserve case and reject whitespace. Assets/symbols are uppercase;
-account, order and client order IDs allow 1..128 ASCII identifier characters.
+Reads use the atomically published `ExchangeReadModel`, never mutable books
+from HTTP threads. It contains copied engine state, full aggregated depth,
+current orders and the latest 1,000 trades globally. The core is not thread-safe;
+direct access belongs to its owning thread. Maker fills update current order
+outcomes; original placement outcomes remain separate for idempotency.
+View publication precedes events and response completion, so reads can observe
+effects before their request finishes. Copies of ledger, order and idempotency
+history grow with retained state; only the recent-trade deque is history-bounded.
 
-`Price.multiply(Quantity, resultScale)` uses `Math.multiplyExact` before exact
-rescaling; overflow (even an intermediate product) and fractional output atoms
-are rejected, never silently rounded. Engine command amounts are canonical long
-atoms: base settlement scale equals quantity scale, quote settlement scale equals
-price scale + quantity scale. Thus notional is `Math.multiplyExact(price, qty)`.
-The current instruments use price scale 2, base scale 8 and USD scale 10. The engine
-constructor enforces one consistent scale per shared asset and a maximum scale of
-18; incompatible market configurations fail immediately. Total customer holdings
-per asset are capped at `Long.MAX_VALUE`: deposits preflight this bound, ensuring
-all subsequent transfers and reservation releases can be represented without
-overflow. Bounds checks precede state mutation.
+## Matching and risk
 
-`AccountBook` owns available/reserved amounts per `(AccountId, Asset)`.
-`RiskManager` checks known instruments, positive tick/lot-compliant sizes and
-sufficient funds. Buy limits reserve limit price times quantity in quote atoms;
-sells reserve base quantity. Market buys require an explicit positive quote
-budget (in quote settlement atoms), reserve that entire budget, and stop before
-exceeding it. A budget above available funds is rejected. Affordable quantity is
-rounded down to whole lots; market remainders never rest. On fills, reservations settle to the
-counterparty; buy price improvement is released immediately. Cancel/expiry
-releases the remaining reservation. Replace preflights its complete reservation
-delta before modifying the existing order. Fees default to zero; later fee
-support must include fees in reservations and credit a `FEES` house account.
+Each symbol has descending bid and ascending ask `TreeMap`s. Each price level
+uses a FIFO `LinkedHashMap<OrderId, OpenOrder>`. An order index supports direct
+lookup and constant-time removal within a level; level lookup/removal costs
+O(log price levels). Cancel/replace scans books to locate the symbol,
+O(number of symbols).
 
-## WAL, snapshots and recovery
+Execution uses the resting price, best price first and FIFO at that price.
+LIMIT+GTC may rest; LIMIT+IOC cancels its remainder. MARKET+GTC and MARKET+IOC
+are both accepted and never rest. FOK preflights the full executable quantity
+and kills an incomplete plan before balances, books or ledger change. A killed
+FOK still allocates an order ID, advances sequence and retains an outcome.
 
-The source of truth is **commands**, not derived events. Each `JournalEntry` stores
-seq, timestamp, stable command type and JSON command payload. `PersistenceCodec`
-uses Jackson mixins with six explicit names (`place-order.v1`, `deposit.v1`, etc.);
-Java class/package names never enter the wire protocol and the engine stays
-framework-free. Unknown names, incompatible snapshots or gaps fail recovery.
-Commands replay business rejections as well as successful mutations.
+Self-trade policy is **reject incoming/newest**. If the executable path reaches
+an order from the same account, the entire placement/replacement is rejected
+before any earlier external fill is applied. Orders outside the limit or
+unaffordable under a buy budget are not executable self-trades.
 
-This avoids persisting both commands and effects and retains the original intent
-for audit. The trade-off is that replay depends on historical matching semantics:
-future rule changes need an explicit command/state version migration or compatible
-versioned handlers. Event sourcing would decouple replay from matching rules but
-requires a separate complete event-application model. Neither event history nor
-exactly-once external delivery is claimed here.
+Replacement quantity means **new remaining quantity**. Same-price decrease or
+equality keeps FIFO position; price changes or increases requeue and can match
+immediately. The ID stays stable. Requeue emits `OrderCancelled(REPLACED)`,
+`OrderReplaced`, then any fills/resting event. Failed preflight preserves the
+existing order and reservation. REST fills include those preceding replacement.
 
-`Journal.append(entry)` returns its committed sequence. Entries start at 1 and are
-contiguous; `readFrom(seq)` is inclusive, `readAfter(seq)` is exclusive, and
-`lastSeq()` aliases `lastSequence()`. `InMemoryJournal` is volatile and synchronized.
-`PostgresJournal` commits each JSONB insert with JDBC autocommit before engine apply;
-sequence allocation remains on the writer. JdbcClient recovery reads use indexed,
-ordered batches of 1000 rows. The adapter holds a session advisory lock on a
-dedicated connection for its entire lifetime (including recovery), and uses that
-same connection for append. Losing the connection therefore prevents unfenced
-writes. Only one writer per database is supported; external SQL writes bypass
-this contract. The pool needs at least two connections for the lease and reads.
+`AccountBook` holds available/reserved balances. `RiskManager` validates
+instruments, positive tick/lot multiples and order fields; `MatchingEngine`
+checks funding against the calculated reservation. Buy limits
+reserve limit price × quantity in quote atoms; sells reserve base quantity.
+Market buys reserve their entire positive quote budget, rejecting budgets above
+available funds even if current liquidity would cost less. Affordable quantity
+rounds down to whole lots. A budget caps spend, not execution price; market sells
+have no price floor.
 
-The pipeline is: assign sequence/time, encode, durable append, apply, publish
-immutable views, record metrics, publish events, periodically save a snapshot,
-complete the future. Any unexpected pipeline failure fences admission and fails
-queued futures; an uncertain append is never retried in the same process. There
-is no rollback of committed effects. Restart replays the committed command; an
-order retry returns its original outcome. Recovery does not publish historical
-events or increment business counters. Business rejections do not fence the writer.
+Fills transfer reserved funds to counterparties, immediately release buy-limit
+price improvement, and retain only a resting remainder's reservation. Cancel and
+expiry release unused funds. Replace checks the new reservation against available
+funds plus the old reservation before mutation. Withdrawals cannot use reserved
+funds. Fees are fixed at zero; no configurable fee/house settlement is implemented.
 
-`SnapshotStore` has memory and Postgres implementations. `snapshot()` queues an
-on-demand capture on the writer; periodic capture occurs every
-`matchforge.snapshot.interval` commands, including no-op retries. Stored snapshots
-include schema version, journal sequence, engine state, order status/fill history,
-and the latest 1000 trades. SHA-256 covers canonical reserialization of the typed
-state, so PostgreSQL JSONB key reordering does not invalidate the checksum. Recovery
-checks checksum, row/state sequence, configured instruments and journal boundary,
-then uses `MatchingEngine.restore` to check financial/book invariants and applies
-the tail. Snapshots are stored atomically by one SQL upsert. Checksums detect
-accidental corruption, not adversarial rewriting. No journal pruning is enabled.
+## Numeric model
 
-`EngineSnapshot` includes balances, open orders in side/price/FIFO order, complete
-ledger, order/trade counters and original idempotency request/outcome pairs.
-`ExchangeReadModel` atomically publishes deeply immutable engine state, book depth,
-current order outcomes and recent trades. Maker fills update their order status;
-original submission outcomes remain separately retained for idempotency. Capturing
-these copies per command is intentionally simple but costs time proportional to
-retained history. Ledger, order and idempotency history are currently unbounded;
-compaction and structural sharing need an explicit future policy.
+Price and quantity are nonnegative scaled `long` values with scales 0–18. Orders
+require positive exact tick/lot multiples. Scale is part of value identity.
+Unsigned plain decimal parsing rejects exponents, fractional-atom loss and
+overflow instead of rounding. REST also rejects numeric JSON tokens for strings.
 
-Shutdown closes admission and drains accepted commands. Spring then closes
-publishers, producer factories and the journal lease through bean dependency order.
-Standalone callers own adapters and must close them after closing EngineService.
-Shutdown waits for accepted work: production listeners must not block indefinitely,
-and database/network timeouts should be set for the deployment.
+Commands carry canonical atoms. Base settlement scale is quantity scale; quote
+settlement scale is price scale + quantity scale. Default markets have price
+scale 2, BTC/ETH scale 8 and USD scale 10. Shared assets require consistent scales;
+no result may exceed scale 18. Notional uses `Math.multiplyExact(price, quantity)`.
+Deposits preflight aggregate customer holdings per asset against `Long.MAX_VALUE`.
 
-## Idempotency, settlement and delivery
+Fixed point avoids binary floating-point ambiguity, but has finite bounds.
+`BigDecimal` handles exact parsing/formatting, `Price.multiply` rescaling and
+displayed averages; it is not the matching representation. API averages use
+`BigInteger` notional accumulation and HALF_UP rounding to price scale. Ledger
+trial balances use `BigInteger` to avoid accumulation overflow.
 
-`MatchingEngine` keys placement by `(AccountId, ClientOrderId)`, stores the complete
-immutable `PlaceOrder` payload and original `CommandResult.Outcome` (including
-original fills). Identical retries return that outcome with `duplicate=true` and
-an empty event batch; different payloads return distinct `CONFLICT` status and
-`DUPLICATE_CLIENT_ORDER_ID` reason mapped to HTTP 409. Every submitted
-envelope still consumes its contiguous command sequence. Lookup/insertion occur
-on the writer. Replay and snapshots restore outcomes, including rejections;
-transport timeouts must not cause a second order.
+## Persistence and recovery
 
-`Ledger` creates immutable signed `Posting` records in balanced `Transaction`s: debit buyer
-quote / credit seller quote, debit seller base / credit buyer base. Each trade's
-postings sum to zero per asset. Deposits and withdrawals use an external clearing
-account so all ledger transactions balance; customer plus house balances equal
-net external funding. The ledger read model is derived **in memory** from the same deterministic command
-application, retained in snapshots and exposed through
-`readModel().engineState().ledger()`. There is no second PostgreSQL projection or
-dual-write failure window. V2 removes the unused V1 `ledger_entry` table. Balanced
-transactions are checked by the `Ledger.Transaction` constructor and conservation
-is checked during recovery and engine/property tests. A SQL cross-row constraint
-is unnecessary for this selected storage model.
+The source of truth is a **command journal**, not an event store. Rows contain
+`seq`, `type`, JSONB `payload`, `created_at`. `PersistenceCodec` uses six explicit
+wire names such as `place-order.v1`, not Java class/package names. Replay derives
+events, balances, books, ledger and idempotency, including business rejections.
+This preserves intent without dual-writing commands and effects, but replay
+depends on historical matching semantics. Future changes require compatible
+handlers or migrations; no general migration framework currently exists.
 
-`EXTERNAL` is reserved and cannot be created as a customer. Reserve/release only
-moves holdings between available and reserved; it creates no settlement posting.
-Deposits, withdrawals and every individual fill emit `LedgerPosted` with balanced
-postings. Fees are fixed at zero in this session. `Ledger.trialBalance` uses
-`BigInteger` for safe accumulation across arbitrarily long histories;
-`assertConservation` reconciles ledger holdings with every account/asset.
-`MatchingEngine.assertInvariants` additionally checks reservations against open
-orders, book crossing, order validity, IDs and the aggregate holdings bound.
+Sequences start at 1 and must be contiguous. `readFrom` is inclusive;
+`readAfter` is exclusive. `PostgresJournal` uses JDBC autocommit for each insert
+and returns after that operation completes, before engine application.
+“Durable” means PostgreSQL acknowledged commit, subject to server/storage
+durability settings. There is no application-side replication/quorum guarantee.
+Memory journal/snapshot adapters are volatile.
 
-`InProcessEventPublisher` defaults to a removable, thread-safe listener registry.
-Each immutable batch is delivered synchronously in registration order. All listeners
-are attempted even if one fails; failure then fences EngineService. Future WebSocket
-listeners must enqueue onto bounded subscriber queues rather than block the writer.
-The WebSocket adapter uses bounded per-client queues and never sends on the writer.
+A PostgreSQL session advisory lock fences competing writers throughout recovery
+and execution. The same dedicated connection holds the lease and appends;
+losing it prevents further writes through that connection. External SQL writers
+bypass the contract. Reads use other connections, so the pool needs at least two.
+PostgreSQL recovery uses ordered batches of 1,000 entries.
 
-`matchforge.events.publisher=kafka` conditionally creates the producer factory,
-KafkaTemplate and `KafkaEventPublisher`. Kafka autoconfiguration is excluded in
-both normal and memory profiles; the default creates no Kafka producer beans.
-The adapter sends versioned JSON events to `matchforge.events`, keyed by symbol for
-trades/resting orders and account for other events (cancel/replace use command
-context). Explicit event names are stable across Java refactors. Sends await broker
-acks with producer idempotence, `acks=all`, a 5-second metadata bound and a 30-second
-delivery timeout. Partial publication/crash can leave a gap; recovery intentionally
-does not resend events. A durable cursor/outbox and consumer deduplication remain
-future work, so this is best-effort publication across crashes, not a durable
-at-least-once or exactly-once delivery guarantee.
+Unexpected append, apply, publisher or snapshot errors fence admission; queued
+futures then fail. An ambiguous append is not retried in the same process.
+Business rejections are ordinary outcomes. There is no rollback of a committed
+command after a later failure. Restart reconstructs committed effects, and order
+retries return recorded outcomes. Funding has no retry key, so blind retries can
+repeat effects. Recovery sends no historical events and increments no business
+counters. Actuator has no custom writer-failure health indicator.
 
-Micrometer records `matchforge.commands.processed` and `matchforge.journal.append`
-timers; `matchforge.orders.accepted`/`rejected` counters with reason, trade/cancel
-counters, per-symbol/side depth-level gauges, and a committed journal-sequence gauge.
-Metrics are recorded directly in the service so Kafka mode retains the same metrics.
-Duplicate retries emit no business counters; their command/journal timers still run.
+`snapshot()` queues an on-demand capture. Automatic capture defaults to every
+1,000 command sequences, including rejections/retries. `EngineSnapshot` and
+`StoredSnapshot.State` both carry version 1. State includes instruments,
+balances, FIFO orders, complete ledger, ID counters, original idempotency pairs,
+current order outcomes and recent trades. PostgreSQL saves one atomic upsert
+per snapshot sequence.
 
-## Configuration, verification and limitations
+SHA-256 covers canonical reserialization of typed state, tolerating JSONB key
+reordering. Startup verifies checksum, versions, row/state sequence, configured
+instruments and journal boundary, restores book/financial invariants, replays
+the tail, and checks invariants again before admission. Gaps or incompatible/
+corrupt latest snapshots fail startup; there is no older-snapshot fallback.
+Checksums detect accidental corruption, not adversarial rewriting. Null
+cancellation reasons are omitted in persistence encoding to preserve legacy
+checksums. Legacy snapshots may lack historical reasons; full replay restores
+them. No journal or PostgreSQL snapshot pruning exists. The memory snapshot
+store retains only the latest snapshot, but its journal retains every entry.
 
-Default configuration targets PostgreSQL on localhost:5432; `DB_URL`,
-`DB_USERNAME`, `DB_PASSWORD`, `JOURNAL_TYPE`, `EVENTS_PUBLISHER` and
-`SNAPSHOT_INTERVAL` override the defaults. `--spring.profiles.active=memory`
-excludes DataSource and Flyway autoconfiguration and wires `InMemoryJournal`.
-`local` includes `memory`; neither requires Docker. All local state is lost on exit.
-Setting only `JOURNAL_TYPE=memory` does not disable database autoconfiguration;
-use the profile for database-free startup. Port is 8080.
+## Idempotency and ledger
 
-Run `./gradlew --no-daemon build` (`.\gradlew.bat --no-daemon build` on Windows).
-Java 21 must already exist; toolchain auto-download is disabled. JUnit Jupiter and
-jqwik both run, and test finalizes XML/HTML JaCoCo reporting. JMH sources belong
-in `src/jmh/java`; see [benchmarks](benchmarks.md) for the synthetic flow,
-serialization measurement and REST load CLI. Integration
-tests must use `@Testcontainers(disabledWithoutDocker = true)` locally and run
-with Docker in CI. Engine JUnit tests cover matching, risk, FIFO/replacements,
-atomic FOK/self-trade rejection, settlement, idempotency and JSON snapshots.
-Two jqwik properties each run 60 generated sequences of 30–100 actions across two
-symbols and three funded accounts, checking invariants after each command and
-identical replay/snapshot continuation. Session 3 adds pipeline recovery, checksum,
-idempotency, backpressure and failure-path tests. A 50-try jqwik journal property
-compares full replay and snapshot-tail recovery. Postgres 16 Testcontainers tests
-cover append/read, writer fencing, durable recovery and checksum tampering; they
-skip without Docker. Kafka routing/failure tests use a mocked broker client.
-REST, WebSocket and Postgres REST restart tests are implemented in Session 4.
+Placement keys are `(AccountId, ClientOrderId)`. The engine retains the canonical
+request and original outcome. Equal retries return it with `duplicate=true` and
+no events, even after later fills/cancel. Changed payloads return `CONFLICT` /
+`DUPLICATE_CLIENT_ORDER_ID` (HTTP 409). Decimal spellings that parse to equal atoms
+compare equally. Snapshot/replay restores successful, cancelled and engine-
+rejected outcomes. Keys have no TTL. Other command types have no retry key.
 
-Authentication is out of scope: requests will carry account IDs, so the planned
-API must not be exposed as a production exchange. The core is implemented;
-REST and WebSocket transports are implemented; durable external delivery remains future work.
-Core reads and snapshots must run on the owning writer thread; callers read the
-service's immutable published views.
+Each fill posts buyer quote debit, seller quote credit, seller base debit and
+buyer base credit. `Ledger.Transaction` checks balance per asset. Deposits and
+withdrawals balance against `EXTERNAL`, which cannot be a customer. It is a
+contra ledger identifier, not an `AccountBook` customer balance. Customer holdings
+reconcile to net external funding. Reserve/release changes available/reserved
+amounts without settlement postings.
 
-Session 5 adds bounded engine and journal JMH benchmarks, a virtual-thread REST
-load generator, a layered non-root Docker image, Compose deployment, and CI with
-coverage reporting and container smoke checks. See [benchmarks](benchmarks.md)
-for measured results and workload limits, and [containers](containers.md) for
-startup, optional Kafka and CI details. Spotless enforces Palantir Java Format,
-explicit imports and LF Java sources as part of `check`.
+Ledger state is derived in memory and retained in snapshots. Flyway V2 drops the
+unused `ledger_entry` projection from V1; there is no second SQL ledger write.
+Existing migrations remain unchanged to preserve Flyway checksums.
+`assertConservation` reconciles each account/asset with postings;
+`assertInvariants` also checks reservations, uncrossed books, open-order validity,
+IDs and total holdings during recovery and tests.
 
+## Events and observability
 
+`InProcessEventPublisher` synchronously invokes removable listeners in
+registration order, attempts all even if one throws, then propagates failure.
+Listeners must enqueue slow work themselves.
 
+`matchforge.events.publisher=kafka` creates an explicit producer factory/template
+and combined publisher: local delivery first, then Kafka. Default mode creates
+no producer. Topic `matchforge.events` uses version-1 wire events and explicit
+event names. Trades/resting orders use symbol keys; other events use account
+keys (cancel/replace receive command context). This establishes no global ordering
+across all partitions.
 
-## REST and market-data transport (Session 4)
+Kafka uses producer idempotence, `acks=all`, a 5-second metadata blocking bound,
+30-second delivery timeout and a 35-second wait per send. Publication follows
+commit and may stop partway through a batch. Recovery does not resend it. There
+is no outbox or durable cursor, so delivery across crashes is best effort, not
+guaranteed at-least-once or exactly-once.
 
-All SPEC v1 routes are implemented under `/api/v1`. Account creation accepts an
-optional `{ "id": "alice" }`; omitting it generates a UUID at the HTTP boundary.
-All price, quantity, balance, budget and signed ledger amounts are JSON strings.
-JSON numeric tokens, exponents, precision loss and overflow are rejected. Boundary
-conversion uses each instrument's canonical fixed-point scales. Weighted average
-fill price uses arbitrary-precision accumulation and HALF_UP rounding to price
-scale; it is null before any fill. Order status maps OPEN to NEW or PARTIALLY_FILLED.
-Cancellation reasons are retained in outcomes, idempotency and snapshots. The additive
-persistence field is omitted when null to preserve legacy snapshot checksums.
-Legacy snapshots lack historical cancellation reasons; full journal replay restores them.
+Metrics are recorded by `EngineService`, not a publisher listener, in both modes:
 
-POST orders returns 201 initially; a successful retry returns 200 with
-`Idempotent-Replay: true` and the original response body, even after maker fills,
-cancellation or restart. Idempotency compares canonical fixed-point payloads, so
-`100` and `100.00` mean the same price. Rejected retries preserve their original
-error status and also carry the replay header. Business rejection problems include
-an `order` extension with REJECTED status and reason. Problems carry a stable
-`code` and a `urn:matchforge:problem:<code>` type. Unknown entities map to 404,
-conflicts to 409, insufficient funds/self-trade to 422, invalid input to 400 and
-writer overload to 503. There is no authentication or authorization; cancel and
-replace resolve the stored owner. This API must not be exposed as a production
-exchange. Replacement quantity means new remaining quantity; omitted fields retain
-the currently published open-order values. Depth is limited to 1..100 and trade
-history requests to 1..1000 (latest first).
+| Meter | Meaning |
+|---|---|
+| `matchforge.commands.processed` | Pipeline timer including publication and periodic snapshots |
+| `matchforge.journal.append` | Append attempt timer |
+| `matchforge.orders.accepted` | Accepted events, with `reason=accepted` |
+| `matchforge.orders.rejected` | Nonduplicate place/replace outcomes with rejection reason |
+| `matchforge.trades` | Trade events |
+| `matchforge.cancels` | Cancellation events, including expiry, FOK kill and replacement cancellation |
+| `matchforge.book.depth` | Price-level counts by symbol/side |
+| `matchforge.journal.seq` | Last acknowledged journal sequence |
 
-Swagger UI is `/swagger-ui.html`, with the OpenAPI document at `/v3/api-docs`.
-Actuator exposes health, info, prometheus and metrics; all meters carry
-`application=matchforge`.
+Duplicates emit no business counters but still run timers. Actuator exposes
+health, info, metrics and Prometheus; configured meters carry
+`application=matchforge`. Counters are process-local, not historical totals.
 
-`/ws/market-data` accepts subscribe/unsubscribe objects containing `op`, `channel`
-(book or trades), and `symbol`. Each new subscription first receives a book
-snapshot. Envelopes contain `channel`, `symbol`, `type`, `sequence`, and `data`.
-The transport sequence is strictly increasing per symbol per connection, shared
-by both channels, and resets on reconnect; it is distinct from the command
-sequence in book data. Reconnect requires a fresh subscription/snapshot. Book
-updates are complete aggregated top-10 snapshots, coalesced every 75ms and sent
-only when levels change. Intermediate book states are intentionally omitted;
-trade prints are FIFO and are never silently dropped for an active subscriber.
+## REST and WebSocket boundaries
 
-Each connection has a 256-message queue, a virtual sender thread and a
-ConcurrentWebSocketSessionDecorator (2-second send / 64-KiB buffer limits).
-An independent watchdog checks blocked sends; queue overflow or a slow send
-closes that connection so clients must resubscribe. Invalid subscriptions close
-with BAD_DATA. Disconnect clears the queue and removes the subscriber; shutdown
-unregisters the publisher listener and stops ticker/senders. In Kafka mode the
-publisher fans out locally as well as to Kafka, preserving WebSocket delivery.
-No replay feed or durable external event-delivery guarantee is provided.
+`ExchangeController` implements accounts/funding, orders/cancel/replace, markets,
+depth/trades, ledger entries and admin snapshots under `/api/v1`. New placements
+return 201; successful identical retries return 200 with `Idempotent-Replay: true`
+and their original body. Rejected retries preserve error status and replay header.
+Current order status comes from GET, not the original placement response.
 
-Integration tests use MockMvc and a real random-port StandardWebSocketClient.
-Docker-gated tests cover a full PostgreSQL REST settlement, context shutdown,
-snapshot plus journal-tail recovery, original idempotent responses, and a real
-Kafka event consumer. The local port-8080 smoke transcript is generated under
-`.codex-logs/session4-smoke.txt`; it is not a benchmark.
+ProblemDetail has a stable `code` and `urn:matchforge:problem:<code>` type; order
+rejections include an `order` extension. Missing entities map to 404, conflicts
+409, insufficient funds/self-trade 422, invalid input 400 and writer
+unavailability 503. Monetary amounts are strings. Order status is NEW,
+PARTIALLY_FILLED, FILLED, CANCELLED or REJECTED; average price is null before fills.
+
+There is **no authentication or authorization**. Cancel/replace resolve owners
+from stored state. Omitted replacement fields are filled from the published
+view before submission, not on the writer; concurrent clients should not treat
+them as a compare-and-set operation. Depth bounds are 1–100 and recent-trade limit
+1–1,000. Order/ledger lists have no pagination. Swagger UI is `/swagger-ui.html`;
+OpenAPI is `/v3/api-docs`.
+
+`/ws/market-data` accepts subscribe/unsubscribe for `book` or `trades` and a
+configured symbol. Every new subscription, even to trades, first gets a book
+snapshot. Envelopes contain `channel`, `symbol`, `type`, `sequence`, `data`.
+Outer sequence increases per symbol per connection, shared by channels, and
+resets on reconnect. Book data separately includes command sequence.
+
+Book updates are complete top-10 aggregated snapshots, coalesced on a 75 ms
+fixed-delay ticker and emitted only if levels change. Intermediate book states
+are intentionally omitted. Trades use per-client FIFO. Each connection has a
+256-message queue, virtual sender, and `ConcurrentWebSocketSessionDecorator`
+with 2-second send / 64-KiB buffer limits. The ticker also checks blocked sends.
+Slow/overflowing clients disconnect and must reconnect/resubscribe. Invalid
+subscriptions close with BAD_DATA. There is no replay or guaranteed delivery
+after disconnect.
+
+The engine listener serializes/enqueues but does not send sockets. Disconnect
+removes the client, clears queued messages and closes asynchronously. Shutdown
+unregisters the listener and stops ticker/senders. Kafka mode retains local feeds.
+
+## Lifecycle and verification
+
+Recovery completes before admission. Shutdown stops admission and drains
+accepted writer work. Spring closes adapters through bean dependencies;
+standalone callers must close the service before its adapters. Unbounded custom
+listeners or JDBC calls can delay draining, so database/network timeouts remain
+an operational configuration responsibility.
+
+Default startup targets PostgreSQL. `memory` disables DataSource/Flyway
+autoconfiguration; `local` includes `memory`. Both are volatile. Compose's
+`kafka` profile starts Redpanda; a separate publisher property enables Kafka in
+the app. Defaults and commands are in the [README](../README.md) and
+[container guide](containers.md).
+
+Verification covers unit tests, jqwik invariants, service failure/recovery,
+MockMvc, a real random-port WebSocket client, and Docker-gated PostgreSQL/Kafka
+tests. The 2026-09-30 local rerun reported 123 tests: 117 passed, six skipped
+without Docker, zero failures/errors. Five are jqwik properties; generated
+trials are not separate test counts. Spotless checks formatting; `build` also
+compiles benchmark/load harnesses and produces JaCoCo HTML/XML. See
+[benchmarks](benchmarks.md) for measured workloads and their limits.
+
+Remaining constraints include one writer/instance, RAM-bound state, unbounded
+history and copying cost, no authentication, no general persistence migration
+framework, and no durable external delivery. Sharding, failover, outbox delivery,
+retention and stronger operational controls remain roadmap work.

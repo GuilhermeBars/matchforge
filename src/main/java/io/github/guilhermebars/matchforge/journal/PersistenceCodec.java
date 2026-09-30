@@ -23,7 +23,7 @@ public final class PersistenceCodec {
         @JsonSubTypes.Type(value = Command.ReplaceOrder.class, name = "replace-order.v1")
     })
     private interface CommandTypes {}
-    // Keep pre-session-4 snapshot checksums stable when the additive field is absent.
+    // Preserve legacy snapshot checksums when the additive cancellation reason is absent.
     private interface OutcomeFields {
         @JsonInclude(JsonInclude.Include.NON_NULL)
         io.github.guilhermebars.matchforge.engine.DomainEvent.CancelReason cancelReason();
