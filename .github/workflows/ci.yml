@@ -41,7 +41,7 @@ jobs:
                       summary.write(f"| {counter.attrib['type']} | {covered} | {total} | {percent:.2f}% |\n")
               else:
                   summary.write('Report unavailable; inspect the build failure.\n')
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v6
         if: always()
         with:
           name: test-and-coverage-reports
@@ -72,7 +72,7 @@ jobs:
       - name: Capture logs
         if: always()
         run: docker compose logs --no-color > compose.log
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v6
         if: always()
         with:
           name: docker-smoke-logs
