@@ -1,6 +1,8 @@
 server:
   port: 8080
 spring:
+  autoconfigure:
+    exclude: org.springframework.boot.autoconfigure.kafka.KafkaAutoConfiguration
   application:
     name: matchforge
   profiles:
@@ -18,6 +20,8 @@ management:
       exposure:
         include: health,prometheus
 matchforge:
+  engine:
+    queue-capacity: ${ENGINE_QUEUE_CAPACITY:1024}
   events:
     publisher: ${EVENTS_PUBLISHER:in-process}
   journal:
@@ -39,3 +43,5 @@ matchforge:
       lot-size: "0.00000001"
       price-scale: 2
       quantity-scale: 8
+
+

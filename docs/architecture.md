@@ -1,14 +1,14 @@
-# Matchforge architecture
+﻿# Matchforge architecture
 
-Sessions 1–2 deliver domain values, validated configuration, the local journal,
-schema, build/test infrastructure, and the framework-free matching/risk/ledger core.
-The HTTP API, durable adapters, dispatcher, publishers and recovery orchestration
-below remain the implementation plan for subsequent sessions.
+Sessions 1–3 deliver the framework-free matching/risk/ledger core, command WAL,
+Postgres and memory persistence, checksummed snapshots, recovery, a bounded
+single-writer service, immutable read models, event publishers and metrics.
+REST and WebSocket endpoints remain for subsequent sessions.
 
 ```mermaid
 flowchart LR
-    REST[api.OrderController / AccountController] --> D[engine.CommandDispatcher]
-    D --> S[engine.CommandSequencer]
+    REST[api.OrderController / AccountController] --> D[service.EngineService]
+    D --> S[writer sequence + clock]
     S --> WAL[journal.Journal: command WAL]
     WAL --> E[engine.MatchingEngine: one writer]
     E --> I[engine-owned idempotency outcomes]
@@ -20,9 +20,9 @@ flowchart LR
     P --> WS[ws.MarketDataWebSocketHandler]
     P --> M[events.MetricsEventListener]
     P --> K[events.KafkaEventPublisher: optional]
-    EV --> V[api.ExchangeReadModel / ledger.LedgerReadModel]
+    EV --> V[service.ExchangeReadModel]
     E --> SS[journal.SnapshotStore]
-    SS --> REC[journal.RecoveryService]
+    SS --> REC[EngineService startup recovery]
     WAL --> REC
     REC --> E
 ```
@@ -34,10 +34,15 @@ All packages live under `io.github.guilhermebars.matchforge`. `domain`, `engine`
 `MatchforgeApplication`, `config.MatchforgeProperties` and adapter configurations
 own framework wiring. REST DTOs do not enter the engine directly.
 
-`CommandDispatcher` owns a bounded queue and one executor thread, with one
-`CompletableFuture<CommandResult>` per submitted command. `CommandSequencer`
-assigns sequence and timestamp before persistence. Account IDs are caller-supplied;
-the engine allocates monotonic order/trade IDs, with counters included in snapshots.
+`EngineService` owns a bounded single-thread executor and returns one
+`CompletableFuture<CommandResult>` per submission. `matchforge.engine.queue-capacity`
+(default 1024) bounds pending work, excluding the one running command. A full or
+closed queue fails the future with `UnavailableException`, annotated for HTTP 503;
+the future REST adapter must unwrap asynchronous failures. The writer assigns the
+contiguous sequence and UTC timestamp (microsecond precision for PostgreSQL) before
+persistence. Account IDs are caller-supplied; monotonic order/trade counters live in
+engine snapshots. Admission resumes only after synchronous startup recovery.
+
 `MatchingEngine.process(CommandEnvelope)` receives sealed command records
 `PlaceOrder`, `CancelOrder`, `ReplaceOrder`, `CreateAccount`, `Deposit`, and
 `Withdraw`. It returns an immutable `CommandResult` and ordered `DomainEvent`
@@ -106,42 +111,64 @@ support must include fees in reservations and credit a `FEES` house account.
 
 ## WAL, snapshots and recovery
 
-`Journal` currently has a volatile `InMemoryJournal`; `PostgresJournal` will
-implement the same contiguous sequence contract with committed inserts into
-`journal_entry(seq, type, payload, created_at)`. Payloads are versioned command
-envelopes containing all replay inputs; event envelopes may be stored too, but
-recovery applies commands once, never both commands and their derived events.
-If event entries use journal sequences, their ordering must be deterministic and
-snapshots must always end on a fully completed command/event batch boundary.
+The source of truth is **commands**, not derived events. Each `JournalEntry` stores
+seq, timestamp, stable command type and JSON command payload. `PersistenceCodec`
+uses Jackson mixins with six explicit names (`place-order.v1`, `deposit.v1`, etc.);
+Java class/package names never enter the wire protocol and the engine stays
+framework-free. Unknown names, incompatible snapshots or gaps fail recovery.
+Commands replay business rejections as well as successful mutations.
 
-The planned writer commits the command WAL, processes the engine (including its
-authoritative idempotency check),
-records its result, updates read models and acknowledges the request. A WAL failure
-has no engine effects. An unexpected failure after commit fences the writer:
-stop admission and recover before continuing. Business rejections are deterministic
-results and are replayable. A crash after commit but before response replays the
-command and returns its original result on retry.
+This avoids persisting both commands and effects and retains the original intent
+for audit. The trade-off is that replay depends on historical matching semantics:
+future rule changes need an explicit command/state version migration or compatible
+versioned handlers. Event sourcing would decouple replay from matching rules but
+requires a separate complete event-application model. Neither event history nor
+exactly-once external delivery is claimed here.
 
-`SnapshotCoordinator` schedules a snapshot every `matchforge.snapshot.interval`
-commands and handles the future admin endpoint. `SnapshotStore` will have
-`InMemorySnapshotStore` and `PostgresSnapshotStore` implementations. Snapshots are
-versioned immutable copies captured at an engine command boundary, containing
-books/FIFO order, balances/reservations, IDs, sequence, idempotency results,
-instrument precision/configuration fingerprint and required read-model state.
-The implemented version-1 `EngineSnapshot` includes concrete instrument records,
-account/balance records, open orders in side/price/FIFO order, complete ledger,
-next order/trade IDs, last command sequence and idempotency request/outcome pairs.
-`MatchingEngine.restore(snapshot)` validates version, precision and financial/book
-invariants. Snapshots use deeply immutable lists and concrete record components;
-Jackson plus `JavaTimeModule` round-trips them without core annotations or mixins.
-The complete ledger/idempotency history is retained in memory for now; compaction
-and bounded retention require a later explicit policy.
-Persist only completed snapshots to `snapshot(seq, payload, created_at)`.
-`RecoveryService` loads the latest compatible snapshot, replays later commands
-without external publication, rebuilds projections and then opens admission.
-Malformed/unsupported persisted versions fail startup rather than skip data.
-Postgres operation assumes one active writer instance; a database advisory lock
-will enforce this. No journal pruning is planned until recovery is proven.
+`Journal.append(entry)` returns its committed sequence. Entries start at 1 and are
+contiguous; `readFrom(seq)` is inclusive, `readAfter(seq)` is exclusive, and
+`lastSeq()` aliases `lastSequence()`. `InMemoryJournal` is volatile and synchronized.
+`PostgresJournal` commits each JSONB insert with JDBC autocommit before engine apply;
+sequence allocation remains on the writer. JdbcClient recovery reads use indexed,
+ordered batches of 1000 rows. The adapter holds a session advisory lock on a
+dedicated connection for its entire lifetime (including recovery), and uses that
+same connection for append. Losing the connection therefore prevents unfenced
+writes. Only one writer per database is supported; external SQL writes bypass
+this contract. The pool needs at least two connections for the lease and reads.
+
+The pipeline is: assign sequence/time, encode, durable append, apply, publish
+immutable views, record metrics, publish events, periodically save a snapshot,
+complete the future. Any unexpected pipeline failure fences admission and fails
+queued futures; an uncertain append is never retried in the same process. There
+is no rollback of committed effects. Restart replays the committed command; an
+order retry returns its original outcome. Recovery does not publish historical
+events or increment business counters. Business rejections do not fence the writer.
+
+`SnapshotStore` has memory and Postgres implementations. `snapshot()` queues an
+on-demand capture on the writer; periodic capture occurs every
+`matchforge.snapshot.interval` commands, including no-op retries. Stored snapshots
+include schema version, journal sequence, engine state, order status/fill history,
+and the latest 1000 trades. SHA-256 covers canonical reserialization of the typed
+state, so PostgreSQL JSONB key reordering does not invalidate the checksum. Recovery
+checks checksum, row/state sequence, configured instruments and journal boundary,
+then uses `MatchingEngine.restore` to check financial/book invariants and applies
+the tail. Snapshots are stored atomically by one SQL upsert. Checksums detect
+accidental corruption, not adversarial rewriting. No journal pruning is enabled.
+
+`EngineSnapshot` includes balances, open orders in side/price/FIFO order, complete
+ledger, order/trade counters and original idempotency request/outcome pairs.
+`ExchangeReadModel` atomically publishes deeply immutable engine state, book depth,
+current order outcomes and recent trades. Maker fills update their order status;
+original submission outcomes remain separately retained for idempotency. Capturing
+these copies per command is intentionally simple but costs time proportional to
+retained history. Ledger, order and idempotency history are currently unbounded;
+compaction and structural sharing need an explicit future policy.
+
+Shutdown closes admission and drains accepted commands. Spring then closes
+publishers, producer factories and the journal lease through bean dependency order.
+Standalone callers own adapters and must close them after closing EngineService.
+Shutdown waits for accepted work: production listeners must not block indefinitely,
+and database/network timeouts should be set for the deployment.
 
 ## Idempotency, settlement and delivery
 
@@ -158,10 +185,13 @@ transport timeouts must not cause a second order.
 quote / credit seller quote, debit seller base / credit buyer base. Each trade's
 postings sum to zero per asset. Deposits and withdrawals use an external clearing
 account so all ledger transactions balance; customer plus house balances equal
-net external funding. `LedgerReadModel` persists postings transactionally with
-unique `(journal_seq, posting_index)` keys for replay-safe updates. The V1 table
-is a rebuildable projection; cross-row balancing is enforced by the service,
-not falsely claimed as a row-level SQL constraint.
+net external funding. The ledger read model is derived **in memory** from the same deterministic command
+application, retained in snapshots and exposed through
+`readModel().engineState().ledger()`. There is no second PostgreSQL projection or
+dual-write failure window. V2 removes the unused V1 `ledger_entry` table. Balanced
+transactions are checked by the `Ledger.Transaction` constructor and conservation
+is checked during recovery and engine/property tests. A SQL cross-row constraint
+is unnecessary for this selected storage model.
 
 `EXTERNAL` is reserved and cannot be created as a customer. Reserve/release only
 moves holdings between available and reserved; it creates no settlement posting.
@@ -172,16 +202,29 @@ postings. Fees are fixed at zero in this session. `Ledger.trialBalance` uses
 `MatchingEngine.assertInvariants` additionally checks reservations against open
 orders, book crossing, order validity, IDs and the aggregate holdings bound.
 
-`InProcessEventPublisher` fans out immutable sequenced batches to WebSocket and
-metrics listeners. `/ws/market-data` accepts book/trade subscriptions and publishes
-aggregated top-N depth and trade prints with sequence numbers. Slow subscribers
-use bounded queues and disconnect/resubscribe on gaps; they never block matching.
-`KafkaEventPublisher` is conditional on `matchforge.events.publisher=kafka`, topic
-`matchforge.events`. Producers are not started in the default in-process mode.
-Future durable delivery needs a journal cursor/outbox and stable event IDs:
-delivery is at least once with consumer deduplication, never claimed exactly once.
-Publisher failures cannot roll back committed trades. Metrics include accepted/
-rejected orders, trades, cancels, command/journal latency, book depth and sequence.
+`InProcessEventPublisher` defaults to a removable, thread-safe listener registry.
+Each immutable batch is delivered synchronously in registration order. All listeners
+are attempted even if one fails; failure then fences EngineService. Future WebSocket
+listeners must enqueue onto bounded subscriber queues rather than block the writer.
+No WebSocket endpoint is implemented in this session.
+
+`matchforge.events.publisher=kafka` conditionally creates the producer factory,
+KafkaTemplate and `KafkaEventPublisher`. Kafka autoconfiguration is excluded in
+both normal and memory profiles; the default creates no Kafka producer beans.
+The adapter sends versioned JSON events to `matchforge.events`, keyed by symbol for
+trades/resting orders and account for other events (cancel/replace use command
+context). Explicit event names are stable across Java refactors. Sends await broker
+acks with producer idempotence, `acks=all`, a 5-second metadata bound and a 30-second
+delivery timeout. Partial publication/crash can leave a gap; recovery intentionally
+does not resend events. A durable cursor/outbox and consumer deduplication remain
+future work, so this is best-effort publication across crashes, not a durable
+at-least-once or exactly-once delivery guarantee.
+
+Micrometer records `matchforge.commands.processed` and `matchforge.journal.append`
+timers; `matchforge.orders.accepted`/`rejected` counters with reason, trade/cancel
+counters, per-symbol/side depth-level gauges, and a committed journal-sequence gauge.
+Metrics are recorded directly in the service so Kafka mode retains the same metrics.
+Duplicate retries emit no business counters; their command/journal timers still run.
 
 ## Configuration, verification and limitations
 
@@ -202,10 +245,17 @@ with Docker in CI. Engine JUnit tests cover matching, risk, FIFO/replacements,
 atomic FOK/self-trade rejection, settlement, idempotency and JSON snapshots.
 Two jqwik properties each run 60 generated sequences of 30–100 actions across two
 symbols and three funded accounts, checking invariants after each command and
-identical replay/snapshot continuation. REST, durable restart and WebSocket
-integration tests belong to later sessions.
+identical replay/snapshot continuation. Session 3 adds pipeline recovery, checksum,
+idempotency, backpressure and failure-path tests. A 50-try jqwik journal property
+compares full replay and snapshot-tail recovery. Postgres 16 Testcontainers tests
+cover append/read, writer fencing, durable recovery and checksum tampering; they
+skip without Docker. Kafka routing/failure tests use a mocked broker client.
+REST and WebSocket integration tests belong to later sessions.
 
 Authentication is out of scope: requests will carry account IDs, so the planned
 API must not be exposed as a production exchange. The core is implemented;
-the API, Postgres journal/recovery, snapshot persistence and publication remain
-for later sessions. Core reads and snapshots must run on the owning writer thread.
+the REST API, WebSocket feed and durable external delivery remain for later sessions.
+Core reads and snapshots must run on the owning writer thread; callers read the
+service's immutable published views.
+
+

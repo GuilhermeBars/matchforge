@@ -1,6 +1,7 @@
 spring:
   autoconfigure:
     exclude:
+      - org.springframework.boot.autoconfigure.kafka.KafkaAutoConfiguration
       - org.springframework.boot.autoconfigure.jdbc.DataSourceAutoConfiguration
       - org.springframework.boot.autoconfigure.flyway.FlywayAutoConfiguration
   flyway:
@@ -10,3 +11,4 @@ matchforge:
     type: memory
   events:
     publisher: in-process
+

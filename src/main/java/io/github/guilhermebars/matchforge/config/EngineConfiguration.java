@@ -1,0 +1,48 @@
+package io.github.guilhermebars.matchforge.config;
+
+import io.github.guilhermebars.matchforge.events.*;
+import io.github.guilhermebars.matchforge.journal.*;
+import io.github.guilhermebars.matchforge.service.EngineService;
+import io.micrometer.core.instrument.MeterRegistry;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.context.annotation.*;
+import org.springframework.kafka.core.*;
+import org.apache.kafka.clients.producer.ProducerConfig;
+import org.apache.kafka.common.serialization.StringSerializer;
+import java.time.Clock;
+import java.util.Map;
+
+@Configuration(proxyBeanMethods = false)
+public class EngineConfiguration {
+    @Bean @ConditionalOnProperty(name = "matchforge.events.publisher", havingValue = "in-process", matchIfMissing = true)
+    InProcessEventPublisher inProcessEventPublisher() { return new InProcessEventPublisher(); }
+    @Configuration(proxyBeanMethods = false)
+    @ConditionalOnProperty(name = "matchforge.events.publisher", havingValue = "kafka")
+    static class KafkaConfiguration {
+        @Bean DefaultKafkaProducerFactory<String, String> eventProducerFactory(
+                @Value("${spring.kafka.bootstrap-servers:localhost:9092}") String servers) {
+            return new DefaultKafkaProducerFactory<>(Map.of(
+                    ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, servers,
+                    ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class,
+                    ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer.class,
+                    ProducerConfig.ACKS_CONFIG, "all",
+                    ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, true,
+                    ProducerConfig.MAX_BLOCK_MS_CONFIG, 5000,
+                    ProducerConfig.DELIVERY_TIMEOUT_MS_CONFIG, 30000,
+                    ProducerConfig.REQUEST_TIMEOUT_MS_CONFIG, 10000));
+        }
+        @Bean KafkaTemplate<String, String> eventKafkaTemplate(DefaultKafkaProducerFactory<String, String> factory) {
+            return new KafkaTemplate<>(factory);
+        }
+        @Bean KafkaEventPublisher kafkaEventPublisher(KafkaTemplate<String, String> template, PersistenceCodec codec) {
+            return new KafkaEventPublisher(template, codec);
+        }
+    }
+    @Bean EngineService engineService(MatchforgeProperties properties, Journal journal, SnapshotStore snapshots,
+                                     PersistenceCodec codec, EventPublisher publisher, MeterRegistry metrics,
+                                     @Value("${matchforge.engine.queue-capacity:1024}") int capacity) {
+        return new EngineService(properties.instruments().stream().map(MatchforgeProperties.Instrument::toDomain).toList(),
+                journal, snapshots, codec, publisher, metrics, properties.snapshot().interval(), capacity, Clock.systemUTC());
+    }
+}

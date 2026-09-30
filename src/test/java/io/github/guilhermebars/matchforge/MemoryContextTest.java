@@ -26,6 +26,8 @@ class MemoryContextTest {
 
     @Test void loadsWithRealMemoryJournalAndNoDatabase() {
         assertThat(journal).isInstanceOf(InMemoryJournal.class);
+        assertThat(context.getBeansOfType(org.springframework.kafka.core.KafkaTemplate.class)).isEmpty();
+        assertThat(context.getBean(io.github.guilhermebars.matchforge.service.EngineService.class).available()).isTrue();
         assertThat(context.getBeansOfType(DataSource.class)).isEmpty();
         assertThat(context.getBeansOfType(Flyway.class)).isEmpty();
         assertThat(properties.journal().type()).isEqualTo("memory");
@@ -35,3 +37,4 @@ class MemoryContextTest {
                 .containsExactly(new Symbol("BTC-USD"), new Symbol("ETH-USD"));
     }
 }
+
