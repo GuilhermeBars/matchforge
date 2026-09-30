@@ -8,7 +8,8 @@ import java.util.Objects;
 public final class InMemoryJournal implements Journal {
     private final List<JournalEntry> entries = new ArrayList<>();
 
-    @Override public synchronized long append(JournalEntry entry) {
+    @Override
+    public synchronized long append(JournalEntry entry) {
         Objects.requireNonNull(entry, "entry");
         if (entry.seq() != Math.addExact(lastSequence(), 1)) {
             throw new IllegalArgumentException("journal sequence must be contiguous");
@@ -17,13 +18,14 @@ public final class InMemoryJournal implements Journal {
         return entry.seq();
     }
 
-    @Override public synchronized List<JournalEntry> readAfter(long sequenceExclusive) {
+    @Override
+    public synchronized List<JournalEntry> readAfter(long sequenceExclusive) {
         if (sequenceExclusive < 0) throw new IllegalArgumentException("sequence must be non-negative");
         return entries.stream().filter(entry -> entry.seq() > sequenceExclusive).toList();
     }
 
-    @Override public synchronized long lastSequence() {
+    @Override
+    public synchronized long lastSequence() {
         return entries.isEmpty() ? 0 : entries.getLast().seq();
     }
 }
-

@@ -1,6 +1,6 @@
 # Matchforge architecture
 
-Sessions 1–4 deliver the framework-free matching/risk/ledger core, command WAL,
+Sessions 1â€“4 deliver the framework-free matching/risk/ledger core, command WAL,
 Postgres and memory persistence, checksummed snapshots, recovery, a bounded
 single-writer service, immutable read models, event publishers and metrics.
 Session 4 adds the v1 REST API, OpenAPI, WebSocket market data and transport integration tests.
@@ -239,11 +239,12 @@ use the profile for database-free startup. Port is 8080.
 Run `./gradlew --no-daemon build` (`.\gradlew.bat --no-daemon build` on Windows).
 Java 21 must already exist; toolchain auto-download is disabled. JUnit Jupiter and
 jqwik both run, and test finalizes XML/HTML JaCoCo reporting. JMH sources belong
-in `src/jmh/java`; no engine performance results exist yet. Later integration
+in `src/jmh/java`; see [benchmarks](benchmarks.md) for the synthetic flow,
+serialization measurement and REST load CLI. Integration
 tests must use `@Testcontainers(disabledWithoutDocker = true)` locally and run
 with Docker in CI. Engine JUnit tests cover matching, risk, FIFO/replacements,
 atomic FOK/self-trade rejection, settlement, idempotency and JSON snapshots.
-Two jqwik properties each run 60 generated sequences of 30–100 actions across two
+Two jqwik properties each run 60 generated sequences of 30â€“100 actions across two
 symbols and three funded accounts, checking invariants after each command and
 identical replay/snapshot continuation. Session 3 adds pipeline recovery, checksum,
 idempotency, backpressure and failure-path tests. A 50-try jqwik journal property
@@ -257,6 +258,13 @@ API must not be exposed as a production exchange. The core is implemented;
 REST and WebSocket transports are implemented; durable external delivery remains future work.
 Core reads and snapshots must run on the owning writer thread; callers read the
 service's immutable published views.
+
+Session 5 adds bounded engine and journal JMH benchmarks, a virtual-thread REST
+load generator, a layered non-root Docker image, Compose deployment, and CI with
+coverage reporting and container smoke checks. See [benchmarks](benchmarks.md)
+for measured results and workload limits, and [containers](containers.md) for
+startup, optional Kafka and CI details. Spotless enforces Palantir Java Format,
+explicit imports and LF Java sources as part of `check`.
 
 
 
@@ -316,4 +324,3 @@ Docker-gated tests cover a full PostgreSQL REST settlement, context shutdown,
 snapshot plus journal-tail recovery, original idempotent responses, and a real
 Kafka event consumer. The local port-8080 smoke transcript is generated under
 `.codex-logs/session4-smoke.txt`; it is not a benchmark.
-

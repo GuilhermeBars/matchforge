@@ -23,8 +23,10 @@ final class FixedPoint {
         if (!decimal.matches("[0-9]+(?:\\.[0-9]+)?")) {
             throw new IllegalArgumentException("expected an unsigned plain decimal");
         }
-        return new BigDecimal(decimal).setScale(scale, RoundingMode.UNNECESSARY)
-                .unscaledValue().longValueExact();
+        return new BigDecimal(decimal)
+                .setScale(scale, RoundingMode.UNNECESSARY)
+                .unscaledValue()
+                .longValueExact();
     }
 
     static String format(long units, int scale) {

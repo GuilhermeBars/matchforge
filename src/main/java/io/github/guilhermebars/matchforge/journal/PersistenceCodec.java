@@ -1,8 +1,8 @@
 package io.github.guilhermebars.matchforge.journal;
 
+import com.fasterxml.jackson.annotation.JsonInclude;
 import com.fasterxml.jackson.annotation.JsonSubTypes;
 import com.fasterxml.jackson.annotation.JsonTypeInfo;
-import com.fasterxml.jackson.annotation.JsonInclude;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
@@ -28,10 +28,13 @@ public final class PersistenceCodec {
         @JsonInclude(JsonInclude.Include.NON_NULL)
         io.github.guilhermebars.matchforge.engine.DomainEvent.CancelReason cancelReason();
     }
-    private final ObjectMapper mapper = new ObjectMapper().registerModule(new JavaTimeModule())
+
+    private final ObjectMapper mapper = new ObjectMapper()
+            .registerModule(new JavaTimeModule())
             .disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS)
             .addMixIn(Command.class, CommandTypes.class)
             .addMixIn(io.github.guilhermebars.matchforge.engine.CommandResult.Outcome.class, OutcomeFields.class);
+
     public String type(Command command) {
         return switch (command) {
             case Command.CreateAccount c -> "create-account.v1";
@@ -42,23 +45,36 @@ public final class PersistenceCodec {
             case Command.ReplaceOrder c -> "replace-order.v1";
         };
     }
+
     public String encode(Object value) {
-        try { return mapper.writeValueAsString(value); }
-        catch (Exception e) { throw new IllegalArgumentException("Cannot encode persisted value", e); }
+        try {
+            return mapper.writeValueAsString(value);
+        } catch (Exception e) {
+            throw new IllegalArgumentException("Cannot encode persisted value", e);
+        }
     }
+
     public <T> T decode(String json, Class<T> type) {
-        try { return mapper.readValue(json, type); }
-        catch (Exception e) { throw new IllegalArgumentException("Invalid persisted value", e); }
+        try {
+            return mapper.readValue(json, type);
+        } catch (Exception e) {
+            throw new IllegalArgumentException("Invalid persisted value", e);
+        }
     }
+
     public Command command(JournalEntry entry) {
         var command = decode(entry.payload(), Command.class);
         if (!type(command).equals(entry.type())) throw new IllegalArgumentException("Command type mismatch");
         return command;
     }
+
     public String hash(Object state) {
         try {
-            return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256")
-                    .digest(encode(state).getBytes(StandardCharsets.UTF_8)));
-        } catch (java.security.NoSuchAlgorithmException e) { throw new IllegalStateException(e); }
+            return HexFormat.of()
+                    .formatHex(MessageDigest.getInstance("SHA-256")
+                            .digest(encode(state).getBytes(StandardCharsets.UTF_8)));
+        } catch (java.security.NoSuchAlgorithmException e) {
+            throw new IllegalStateException(e);
+        }
     }
 }

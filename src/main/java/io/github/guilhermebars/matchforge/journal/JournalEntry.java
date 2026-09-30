@@ -8,7 +8,8 @@ public record JournalEntry(long seq, String type, String payload, Instant create
     public JournalEntry {
         if (seq <= 0) throw new IllegalArgumentException("seq must be positive");
         if (Objects.requireNonNull(type, "type").isBlank()) throw new IllegalArgumentException("type is blank");
-        if (Objects.requireNonNull(payload, "payload").isBlank()) throw new IllegalArgumentException("payload is blank");
+        if (Objects.requireNonNull(payload, "payload").isBlank())
+            throw new IllegalArgumentException("payload is blank");
         Objects.requireNonNull(createdAt, "createdAt");
     }
 }

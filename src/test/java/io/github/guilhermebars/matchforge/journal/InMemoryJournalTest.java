@@ -1,16 +1,19 @@
 package io.github.guilhermebars.matchforge.journal;
 
-import org.junit.jupiter.api.Test;
-import java.time.Instant;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatIllegalArgumentException;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
-import static org.assertj.core.api.Assertions.*;
+import java.time.Instant;
+import org.junit.jupiter.api.Test;
 
 class InMemoryJournalTest {
     private JournalEntry entry(long sequence) {
         return new JournalEntry(sequence, "command.v1", "{}", Instant.EPOCH);
     }
 
-    @Test void appendsContiguouslyAndReturnsImmutableDetachedReads() {
+    @Test
+    void appendsContiguouslyAndReturnsImmutableDetachedReads() {
         var journal = new InMemoryJournal();
         assertThat(journal.lastSequence()).isZero();
         journal.append(entry(1));

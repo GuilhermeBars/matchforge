@@ -3,8 +3,14 @@ package io.github.guilhermebars.matchforge.domain;
 import java.util.Objects;
 
 /** Canonical scales and admissible price/quantity increments for one market. */
-public record InstrumentConfig(Symbol symbol, Asset baseAsset, Asset quoteAsset,
-                               Price tickSize, Quantity lotSize, int priceScale, int quantityScale) {
+public record InstrumentConfig(
+        Symbol symbol,
+        Asset baseAsset,
+        Asset quoteAsset,
+        Price tickSize,
+        Quantity lotSize,
+        int priceScale,
+        int quantityScale) {
     public InstrumentConfig {
         Objects.requireNonNull(symbol, "symbol");
         Objects.requireNonNull(baseAsset, "baseAsset");

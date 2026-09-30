@@ -1,15 +1,17 @@
 package io.github.guilhermebars.matchforge.config;
 
-import io.github.guilhermebars.matchforge.domain.*;
-import org.springframework.boot.context.properties.ConfigurationProperties;
-
+import io.github.guilhermebars.matchforge.domain.Asset;
+import io.github.guilhermebars.matchforge.domain.InstrumentConfig;
+import io.github.guilhermebars.matchforge.domain.Price;
+import io.github.guilhermebars.matchforge.domain.Quantity;
+import io.github.guilhermebars.matchforge.domain.Symbol;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Objects;
+import org.springframework.boot.context.properties.ConfigurationProperties;
 
 @ConfigurationProperties("matchforge")
-public record MatchforgeProperties(Events events, Journal journal, Snapshot snapshot,
-                                   List<Instrument> instruments) {
+public record MatchforgeProperties(Events events, Journal journal, Snapshot snapshot, List<Instrument> instruments) {
     public MatchforgeProperties {
         Objects.requireNonNull(events, "events");
         Objects.requireNonNull(journal, "journal");
@@ -46,12 +48,23 @@ public record MatchforgeProperties(Events events, Journal journal, Snapshot snap
         }
     }
 
-    public record Instrument(String symbol, String baseAsset, String quoteAsset,
-                             String tickSize, String lotSize, int priceScale, int quantityScale) {
+    public record Instrument(
+            String symbol,
+            String baseAsset,
+            String quoteAsset,
+            String tickSize,
+            String lotSize,
+            int priceScale,
+            int quantityScale) {
         public InstrumentConfig toDomain() {
-            return new InstrumentConfig(new Symbol(symbol), new Asset(baseAsset), new Asset(quoteAsset),
-                    Price.parse(tickSize, priceScale), Quantity.parse(lotSize, quantityScale),
-                    priceScale, quantityScale);
+            return new InstrumentConfig(
+                    new Symbol(symbol),
+                    new Asset(baseAsset),
+                    new Asset(quoteAsset),
+                    Price.parse(tickSize, priceScale),
+                    Quantity.parse(lotSize, quantityScale),
+                    priceScale,
+                    quantityScale);
         }
     }
 }

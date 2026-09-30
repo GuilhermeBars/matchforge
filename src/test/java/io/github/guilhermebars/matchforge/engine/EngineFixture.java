@@ -1,9 +1,21 @@
 package io.github.guilhermebars.matchforge.engine;
 
-import io.github.guilhermebars.matchforge.domain.*;
+import static io.github.guilhermebars.matchforge.engine.Command.CreateAccount;
+import static io.github.guilhermebars.matchforge.engine.Command.Deposit;
+import static io.github.guilhermebars.matchforge.engine.Command.PlaceOrder;
+
+import io.github.guilhermebars.matchforge.domain.AccountId;
+import io.github.guilhermebars.matchforge.domain.Asset;
+import io.github.guilhermebars.matchforge.domain.ClientOrderId;
+import io.github.guilhermebars.matchforge.domain.InstrumentConfig;
+import io.github.guilhermebars.matchforge.domain.OrderType;
+import io.github.guilhermebars.matchforge.domain.Price;
+import io.github.guilhermebars.matchforge.domain.Quantity;
+import io.github.guilhermebars.matchforge.domain.Side;
+import io.github.guilhermebars.matchforge.domain.Symbol;
+import io.github.guilhermebars.matchforge.domain.TimeInForce;
 import java.time.Instant;
 import java.util.List;
-import static io.github.guilhermebars.matchforge.engine.Command.*;
 
 class EngineFixture {
     static final Asset BTC = new Asset("BTC"), ETH = new Asset("ETH"), USD = new Asset("USD");
@@ -14,6 +26,7 @@ class EngineFixture {
             new InstrumentConfig(ETH_USD, ETH, USD, new Price(2, 2), new Quantity(2, 8), 2, 8));
     MatchingEngine engine = new MatchingEngine(CONFIG);
     private int client;
+
     EngineFixture() {
         for (var account : List.of(A, B, C)) {
             run(new CreateAccount(account));
@@ -22,22 +35,38 @@ class EngineFixture {
             run(new Deposit(account, ETH, 10_000));
         }
     }
+
     CommandResult run(Command command) {
         long seq = engine.lastSequence() + 1;
         var result = engine.process(new CommandEnvelope(seq, Instant.EPOCH.plusSeconds(seq), command));
         engine.assertInvariants();
         return result;
     }
+
     PlaceOrder request(AccountId account, Side side, long price, long quantity) {
-        return new PlaceOrder(account, new ClientOrderId("c" + ++client), BTC_USD,
-                side, OrderType.LIMIT, TimeInForce.GTC, price, quantity, null);
+        return new PlaceOrder(
+                account,
+                new ClientOrderId("c" + ++client),
+                BTC_USD,
+                side,
+                OrderType.LIMIT,
+                TimeInForce.GTC,
+                price,
+                quantity,
+                null);
     }
+
     CommandResult limit(AccountId account, Side side, long price, long quantity) {
         return run(request(account, side, price, quantity));
     }
-    CommandResult special(AccountId account, Side side, OrderType type, TimeInForce tif,
-                          long price, long quantity, Long budget) {
-        return run(new PlaceOrder(account, new ClientOrderId("c" + ++client), BTC_USD, side, type, tif, price, quantity, budget));
+
+    CommandResult special(
+            AccountId account, Side side, OrderType type, TimeInForce tif, long price, long quantity, Long budget) {
+        return run(new PlaceOrder(
+                account, new ClientOrderId("c" + ++client), BTC_USD, side, type, tif, price, quantity, budget));
     }
-    static List<DomainEvent.TradeExecuted> trades(CommandResult result) { return result.outcome().trades(); }
+
+    static List<DomainEvent.TradeExecuted> trades(CommandResult result) {
+        return result.outcome().trades();
+    }
 }
